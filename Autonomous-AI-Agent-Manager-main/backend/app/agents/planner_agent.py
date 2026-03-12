@@ -1,0 +1,193 @@
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field, ConfigDict
+from app.core.llm import LLMClient
+from app.core.skill_matcher import SkillMatcher
+
+
+class GeneratedTask(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    
+    """Schema for a single generated task"""
+    title: str = Field(description="Task title")
+    description: str = Field(description="Detailed task description")
+    estimated_hours: float = Field(description="Estimated hours to complete")
+    required_skills: List[str] = Field(description="Skills required for this task")
+    priority: str = Field(description="Priority level: high, medium, or low")
+    deadline: str = Field(description="Relative deadline (e.g. 'Day 2', 'Week 1', 'After Feature X')")
+
+class PlanResponse(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    
+    """Schema for the complete planning response"""
+    tasks: List[GeneratedTask] = Field(description="List of generated tasks")
+    total_estimated_hours: float = Field(description="Total project hours")
+    recommended_team_size: int = Field(description="Recommended team size")
+
+class PlannerAgent:
+    """
+    AI Agent responsible for breaking down projects into actionable tasks.
+    Uses LLM to analyze project requirements and generate detailed task plans.
+    Integrated with ML-based SkillMatcher for automatic employee assignment.
+    """
+    
+    def __init__(self):
+        self.llm = LLMClient()
+        self.matcher = SkillMatcher()
+    
+    async def plan(
+        self, 
+        project_title: str, 
+        project_description: str,
+        required_skills: List[str],
+        experience_required: float,
+        days_remaining: int = 7,
+        is_overdue: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Generate a detailed project plan with technical tasks.
+        """
+        
+        # Construct the planning prompt
+        if is_overdue:
+            prompt = f"""You are an expert Crisis Manager and Technical Architect.
+            
+Project: {project_title}
+Context: {project_description}
+Expertise Level: {experience_required} years
+Current Status: PROJECT IS OVERDUE (Original Deadline Missed).
+
+Your goal is to create a RECOVERY PLAN to minimize damage and complete the project as fast as possible.
+
+CRITICAL RECOVERY RULES:
+1. **PRIORITIZE CRITICAL PATH**: Focus ONLY on tasks essential for MVP/Release. Cut nice-to-haves.
+2. **AGGRESSIVE SCHEDULING**: Tasks should be broken down for maximum parallelization.
+3. **DAMAGE CONTROL**: Identify the most critical failing components first.
+4. **NEW TIMELINE**: You must estimate a realistic recovery timeline (e.g. 5 days, 10 days).
+
+For each task, provide:
+1. Title: Action-oriented recovery task (e.g. "Hotfix: Database Schema", "Critical: Auth Service").
+2. Description: Specific recovery steps.
+3. Estimated Hours: Optimistic but realistic.
+4. Required Skills: Technologies needed.
+5. Priority: MUST be 'critical' or 'high'.
+6. Deadline: Relative from NOW (e.g. "Day 1 (Recovery)", "Day 3 (Recovery)").
+
+Return ONLY a valid JSON object:
+{{
+    "tasks": [
+        {{
+            "title": "Critical Recovery Task",
+            "description": "Immediate fix implementation",
+            "estimated_hours": 4.0,
+            "required_skills": ["Python", "SQL"],
+            "priority": "critical",
+            "deadline": "Day 1 (Recovery)"
+        }}
+    ],
+    "total_estimated_hours": 40.0,
+    "recommended_team_size": 3
+}}"""
+        else:
+            prompt = f"""You are an expert technical architect and project manager.
+        
+Project: {project_title}
+Context: {project_description}
+Expertise Level: {experience_required} years
+Project Duration: {days_remaining} days remaining until final deadline.
+
+Your goal is to decompose this project into EXACTLY 10 technical tasks that follow a logical implementation sequence.
+
+CRITICAL LOGIC RULES:
+1. **SEQUENTIAL DEPENDENCY**: You cannot deploy what isn't built. Infrastructure and Core Features MUST come before 'Final Deployment' or 'Production Setup'.
+2. **PHASED APPROACH**: 
+   - Early: Database Schema, Auth, Core API.
+   - Middle: Frontend UI, Business Logic, Integration.
+   - Late: Testing, DevOps, Production Deployment.
+3. **REALISTIC DEADLINES**: Assign a `deadline` that MUST be within the {days_remaining} day project window.
+   - Use formats like 'Day 1-2', 'Day 3', 'Day {days_remaining}'.
+   - NO task deadline can exceed Day {days_remaining}.
+4. **TIME PRESSURE**: If days remaining is low (e.g. 3-5 days), tasks must be more aggressive and focused on MVP.
+
+Categories to cover:
+- Frontend UI
+- Authentication/Security
+- Backend API & Logic
+- Database Architecture
+- DevOps/Infrastructure
+
+For each task, provide:
+1. Title: Unique and specific.
+2. Description: Deep technical implementation details.
+3. Estimated Hours: Realistic engineering effort.
+4. Required Skills: Specific technologies needed.
+5. Priority: Based on path-to-launch importance.
+6. Deadline: Relative timing in the project lifecycle (MUST be within Day 1 to Day {days_remaining}).
+
+Return ONLY a valid JSON object:
+{{
+    "tasks": [
+        {{
+            "title": "Specific Task Name",
+            "description": "Exhaustive implementation guide",
+            "estimated_hours": 8.0,
+            "required_skills": ["React", "FastAPI"],
+            "priority": "high",
+            "deadline": "Day 2"
+        }}
+    ],
+    "total_estimated_hours": 120.0,
+    "recommended_team_size": 4
+}}"""
+        
+        try:
+            # Generate structured response
+            result = await self.llm.generate_structured(
+                prompt=prompt,
+                response_schema=PlanResponse,
+                temperature=0.5 # Lower temperature for better structural consistency
+            )
+            
+            # 🔥 Step 2: Assign employees using ML SkillMatcher
+            enriched_tasks = []
+            used_employee_ids = set()
+
+            for task in result.tasks:
+                task_dict = task.model_dump()
+
+                try:
+                    ranked = self.matcher.match(
+                        required_skills=task.required_skills,
+                        employees=employees
+                    )
+
+                    # Assign best available employee
+                    assigned_employee = None
+                    for candidate in ranked:
+                        if candidate["employee_id"] not in used_employee_ids:
+                            assigned_employee = candidate
+                            break
+
+                    if assigned_employee:
+                        task_dict["assigned_employee_id"] = assigned_employee["employee_id"]
+                        task_dict["match_score"] = assigned_employee["score"]
+                        used_employee_ids.add(assigned_employee["employee_id"])
+                    else:
+                        task_dict["assigned_employee_id"] = None
+                        task_dict["match_score"] = 0
+
+                except Exception:
+                    task_dict["assigned_employee_id"] = None
+                    task_dict["match_score"] = 0
+
+                enriched_tasks.append(task_dict)
+
+            # 🔥 Final Combined Response
+            return {
+                "tasks": enriched_tasks,
+                "total_estimated_hours": result.total_estimated_hours,
+                "recommended_team_size": result.recommended_team_size
+            }
+
+
+        except Exception as e:
+            raise RuntimeError(f"Planning failed: {str(e)}")
